@@ -1,0 +1,113 @@
+import os
+import re
+import pandas as pd
+from docx import Document
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
+
+# ---------- CONFIG ----------
+# Folder with your .docx interview transcripts
+TRANSCRIPTS_FOLDER = "transcripts"
+
+# Very simple patterns – adjust to your transcript style
+QUESTION_PREFIXES = [r"^Q\d*[:\-]\s*", r"^Interviewer[:\-]\s*"]
+ANSWER_PREFIXES   = [r"^A\d*[:\-]\s*", r"^Participant[:\-]\s*", r"^User[:\-]\s*"]
+
+# Number of clusters you want
+NUM_CLUSTERS = 5
+
+# ---------- HELPERS ----------
+
+def is_question(line):
+    return any(re.match(p, line.strip(), re.IGNORECASE) for p in QUESTION_PREFIXES)
+
+def is_answer(line):
+    return any(re.match(p, line.strip(), re.IGNORECASE) for p in ANSWER_PREFIXES)
+
+def strip_prefix(line, prefixes):
+    for p in prefixes:
+        if re.match(p, line.strip(), re.IGNORECASE):
+            return re.sub(p, "", line.strip(), flags=re.IGNORECASE).strip()
+    return line.strip()
+
+def extract_qas_from_docx(path):
+    """
+    Returns list of dicts: {file, question, answer}
+    Assumes alternating Q / A blocks, possibly multi‑line.
+    """
+    doc = Document(path)
+    lines = [p.text for p in doc.paragraphs if p.text.strip()]
+
+    qa_records = []
+    current_question = None
+    current_answer = None
+
+    mode = None  # "Q" or "A"
+
+    for line in lines:
+        if is_question(line):
+            # If we already had a Q + A, save it
+            if current_question and current_answer:
+                qa_records.append({
+                    "file": os.path.basename(path),
+                    "question": current_question.strip(),
+                    "answer": current_answer.strip()
+                })
+                current_answer = None
+
+            current_question = strip_prefix(line, QUESTION_PREFIXES)
+            mode = "Q"
+
+        elif is_answer(line):
+            # Start a new answer block
+            current_answer = strip_prefix(line, ANSWER_PREFIXES)
+            mode = "A"
+
+        else:
+            # Continuation line: append to current question or answer
+            if mode == "Q" and current_question is not None:
+                current_question += " " + line.strip()
+            elif mode == "A" and current_answer is not None:
+                current_answer += " " + line.strip()
+
+    # Flush last pair
+    if current_question and current_answer:
+        qa_records.append({
+            "file": os.path.basename(path),
+            "question": current_question.strip(),
+            "answer": current_answer.strip()
+        })
+
+    return qa_records
+
+# ---------- MAIN PIPELINE ----------
+
+all_qa = []
+
+for fname in os.listdir(TRANSCRIPTS_FOLDER):
+    if fname.lower().endswith(".docx"):
+        path = os.path.join(TRANSCRIPTS_FOLDER, fname)
+        records = extract_qas_from_docx(path)
+        all_qa.extend(records)
+
+df = pd.DataFrame(all_qa)
+
+if df.empty:
+    raise ValueError("No Q/A pairs found. Check your prefixes and folder path.")
+
+# Vectorize only the answers for clustering
+vectorizer = TfidfVectorizer(stop_words="english")
+X = vectorizer.fit_transform(df["answer"])
+
+kmeans = KMeans(n_clusters=NUM_CLUSTERS, random_state=42)
+df["cluster"] = kmeans.fit_predict(X)
+
+# Optional: sort by cluster and question
+df_sorted = df.sort_values(["cluster", "question"])
+
+# Show a preview
+print(df_sorted.head(20))
+
+# Save clustered data to CSV for analysis in Excel / Sheets / Notion
+df_sorted.to_csv("clustered_answers_with_context.csv", index=False)
+print("Saved to clustered_answers_with_context.csv")
